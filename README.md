@@ -26,7 +26,7 @@ npm run dev
 ### 其他命令
 
 ```bash
-npm test            # 运行规划引擎、协同同步单元测试与冲突流程组件测试（vitest，260 项）
+npm test            # 运行规划引擎、协同同步单元测试与冲突流程组件测试（vitest，273 项）
 npm run build       # 类型检查 + 生产构建（输出 dist/）
 npm run preview     # 预览生产构建（http://localhost:4173）
 ```
@@ -176,7 +176,9 @@ npm run preview     # 预览生产构建（http://localhost:4173）
 - 所有变更（含迁移、导入、清空、**撤销与重做本身**）均发布为一个新修订并进入历史栈。
 
 ### 本机持久化与多标签页协同
-- 所有会改变 Plan 的操作都会生成一个**修订（revision）**：用 `crypto.randomUUID()` 生成 id，记录 `parentRevisionIds`、`clientId` 与**完整 Plan**，写入 `localStorage` 并更新 `head` 指针后通过 `BroadcastChannel` 广播；
+- 所有会改变 Plan 的操作都会生成一个**修订（revision）**：用 `crypto.randomUUID()` 生成 id，记录 `parentRevisionIds`、`clientId` 与**完整 Plan**；
+- 修订全集与 `head` 指针收敛为**单个持久化状态**（`localStorage` 键 `ipv4-subnet-planner/state/v2`），每次提交以**一次 `setItem` 原子替换**，杜绝双键各写一半留下的半提交状态；启动时自动**兼容迁移旧版双键数据**（`revisions/v1` + `head/v1`），迁移成功后清理旧键；
+- **只有完整状态写入成功后才切换内存 head、更新界面历史并广播**；写入失败（容量耗尽、权限限制等）时**保留提交前规划、显示明确错误**，普通编辑、撤销/重做、导入与迁移均**不产生幽灵修订**，其他标签页也**不会收到失败修订**；冲突合并写入失败时**保持冲突锁定**，修复存储后可重试；
 - 新标签页打开（或刷新）时恢复 `head` 指向、且通过现有规划校验的修订；`head` 损坏时自动恢复到最近的完整叶子修订；
 - 收到其他标签页的更新时**只按修订图的祖先关系**判定，绝不按时间戳覆盖：
   - 当前版本是收到修订的**祖先** → 自动**快进**，并在本页记为**一次可撤销变更**；
