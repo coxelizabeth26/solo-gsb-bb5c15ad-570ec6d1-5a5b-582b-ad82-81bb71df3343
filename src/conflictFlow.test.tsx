@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import stylesCss from './styles.css?raw';
 import App from './App';
-import { GENESIS_REVISION_ID, Revision } from './lib/revisionStore';
+import { GENESIS_REVISION_ID, STATE_STORAGE_KEY, Revision } from './lib/revisionStore';
 import { emptyPlan } from './lib/model';
 
 /** 从编译后的样式表中取出某条选择器规则的声明文本（用于回归指针事件/层级修复）。 */
@@ -14,13 +14,24 @@ function declarationsOf(selector: string): string {
   return match[1];
 }
 
-/** 通过 storage 事件投递一个外部标签页写入的修订文档（App 用它模拟跨标签页收到更新）。 */
+/** 通过 storage 事件投递一个外部标签页写入的状态文档（App 用它模拟跨标签页收到更新）。 */
 function postExternalRevisions(revisions: Revision[]): void {
+  // 以当前单键状态为基础追加外部修订（headId 不变，由修订图判定分叉）。
+  const raw = window.localStorage.getItem(STATE_STORAGE_KEY);
+  const current: { version: 2; headId: string; revisions: Revision[] } = raw
+    ? JSON.parse(raw)
+    : { version: 2 as const, headId: GENESIS_REVISION_ID, revisions: [] };
+  const merged = new Map(current.revisions.map((r) => [r.id, r]));
+  for (const r of revisions) merged.set(r.id, r);
   act(() => {
     window.dispatchEvent(
       new StorageEvent('storage', {
-        key: 'ipv4-subnet-planner/revisions/v1',
-        newValue: JSON.stringify({ version: 1, revisions }),
+        key: STATE_STORAGE_KEY,
+        newValue: JSON.stringify({
+          version: 2,
+          headId: current.headId,
+          revisions: [...merged.values()],
+        }),
       }),
     );
   });
@@ -63,6 +74,7 @@ function rowButton(rowName: string, name: string): HTMLElement {
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   window.localStorage.clear();
   window.sessionStorage.clear();
   // BroadcastChannel 在 jsdom 中不存在：App 已对其降级（仅 storage 事件协同）
@@ -199,5 +211,92 @@ describe('冲突解决流程：选择版本后解除锁定', () => {
     expect(screen.getByText(/暂无分配/)).toBeTruthy();
     // 锁定解除：工具栏此前禁用的入口恢复
     expect(screen.getByRole('button', { name: '清空' }).hasAttribute('disabled')).toBe(false);
+  });
+});
+
+describe('本地存储写入失败：界面保留提交前规划并显示明确错误，无幽灵版本', () => {
+  /** 让 localStorage.setItem 对单键状态文档持续抛错（模拟配额耗尽/权限限制）。 */
+  function breakStateWrites() {
+    const orig = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+      this: Storage,
+      key: string,
+      value: string,
+    ) {
+      if (key === STATE_STORAGE_KEY) {
+        const err = new Error('QuotaExceededError: 存储空间不足');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+      return orig.call(this, key, value);
+    });
+  }
+
+  it('普通编辑落盘失败：示例内容不上屏、显示错误提示，刷新后仍为原规划', () => {
+    window.localStorage.clear();
+    const utils = render(<App />);
+
+    // 启动成功（创世已落盘）后令后续写入全部失败
+    expect(screen.getByText(/暂无分配/) || screen.queryByText('数据中心-A')).toBeTruthy();
+    breakStateWrites();
+
+    fireEvent.click(screen.getByRole('button', { name: '载入示例' }));
+
+    // 明确错误提示
+    const toast = screen.getByRole('alert');
+    expect(toast.textContent).toContain('本地存储');
+    // 提交前规划保留：示例分配不上屏
+    const heading = screen.getByRole('heading', { name: /^分配清单/ });
+    expect(heading.closest('section')!.textContent).not.toContain('数据中心-A');
+
+    // 存储中没有任何幽灵修订：重新挂载后仍是创世空规划
+    utils.unmount();
+    vi.restoreAllMocks();
+    render(<App />);
+    expect(screen.queryByText('数据中心-A')).toBeNull();
+  });
+
+  it('撤销落盘失败：规划与撤销/重做栈保持不变并提示错误', () => {
+    window.localStorage.clear();
+    const utils = render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: '载入示例' }));
+    expect(screen.getAllByText('数据中心-A').length).toBeGreaterThan(0);
+
+    breakStateWrites();
+    fireEvent.click(screen.getByRole('button', { name: /撤销/ }));
+
+    // 错误已提示，且规划仍是示例（撤销未生效）
+    expect(screen.getByRole('alert').textContent).toContain('本地存储');
+    expect(screen.getAllByText('数据中心-A').length).toBeGreaterThan(0);
+
+    // 恢复存储后撤销仍可正常工作（栈未被失败操作破坏）
+    vi.restoreAllMocks();
+    fireEvent.click(screen.getByRole('button', { name: /撤销/ }));
+    expect(screen.queryByText('数据中心-A')).toBeNull();
+    // 重做可回到示例
+    fireEvent.click(screen.getByRole('button', { name: /重做/ }));
+    expect(screen.getAllByText('数据中心-A').length).toBeGreaterThan(0);
+    utils.unmount();
+  });
+
+  it('冲突合并落盘失败：保持冲突锁定，弹窗不关闭、规划不切换', () => {
+    const utils = setupConflict();
+
+    breakStateWrites();
+    fireEvent.click(screen.getByRole('button', { name: '采用外部' }));
+
+    // 明确错误 + 冲突弹窗与锁定仍在
+    expect(screen.getByRole('alert').textContent).toContain('本地存储');
+    expect(screen.getByRole('alertdialog', { name: '检测到分叉更新' })).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toContain('编辑已锁定');
+    // 本页示例规划保留，未被外部空规划替换
+    expect(screen.getAllByText('数据中心-A').length).toBeGreaterThan(0);
+
+    // 恢复存储后合并仍可成功（锁定可正常解除）
+    vi.restoreAllMocks();
+    fireEvent.click(screen.getByRole('button', { name: '采用外部' }));
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(screen.queryByText('数据中心-A')).toBeNull();
+    utils.unmount();
   });
 });

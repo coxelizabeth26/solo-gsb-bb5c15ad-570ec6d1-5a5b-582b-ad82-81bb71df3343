@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   GENESIS_REVISION_ID,
   HEAD_STORAGE_KEY,
   REVISIONS_STORAGE_KEY,
+  STATE_STORAGE_KEY,
   Revision,
   RevisionSync,
   isAncestor,
@@ -33,6 +34,32 @@ class MemStorage implements Storage {
   setItem(key: string, value: string): void {
     this.map.set(key, value);
   }
+}
+
+/**
+ * 可注入的失败存储：setItem/removeItem 按配额（QuotaExceededError 风格）
+ * 或被 shouldFail 回调拒绝（权限限制/隐私模式风格），用于复现写盘失败。
+ */
+class FailingStorage extends MemStorage {
+  constructor(
+    private readonly shouldFail: (key: string, value: string) => boolean,
+    private readonly message = 'QuotaExceededError',
+  ) {
+    super();
+  }
+  override setItem(key: string, value: string): void {
+    if (this.shouldFail(key, value)) {
+      const err = new Error(this.message);
+      err.name = 'QuotaExceededError';
+      throw err;
+    }
+    super.setItem(key, value);
+  }
+}
+
+/** 读取单键原子状态文档。 */
+function readState(storage: Storage): { version: number; headId: string; revisions: Revision[] } {
+  return JSON.parse(storage.getItem(STATE_STORAGE_KEY)!);
 }
 
 type Message = { data: unknown };
@@ -121,15 +148,19 @@ afterEach(() => {
 });
 
 describe('创世与持久化', () => {
-  it('空存储以固定 id 的空规划创世修订启动并持久化', () => {
+  it('空存储以固定 id 的空规划创世修订启动并持久化为单键原子状态', () => {
     const storage = new MemStorage();
     const sync = openSync(storage, 'c1', rec());
     expect(sync.head.id).toBe(GENESIS_REVISION_ID);
     expect(sync.head.plan).toEqual(emptyPlan());
-    expect(storage.getItem(HEAD_STORAGE_KEY)).toBe(GENESIS_REVISION_ID);
-    const doc = JSON.parse(storage.getItem(REVISIONS_STORAGE_KEY)!);
-    expect(doc.revisions).toHaveLength(1);
-    expect(doc.revisions[0].id).toBe(GENESIS_REVISION_ID);
+    const state = readState(storage);
+    expect(state.version).toBe(2);
+    expect(state.headId).toBe(GENESIS_REVISION_ID);
+    expect(state.revisions).toHaveLength(1);
+    expect(state.revisions[0].id).toBe(GENESIS_REVISION_ID);
+    // 单键形态：旧版双键不存在
+    expect(storage.getItem(REVISIONS_STORAGE_KEY)).toBeNull();
+    expect(storage.getItem(HEAD_STORAGE_KEY)).toBeNull();
     sync.destroy();
   });
 
@@ -152,13 +183,152 @@ describe('创世与持久化', () => {
     const storage = new MemStorage();
     const sync = openSync(storage, 'c1', rec(), counterUuid('r'));
     const parent = sync.head.id;
-    const rev = sync.commit(rootOnlyPlan('1'));
+    const result = sync.commit(rootOnlyPlan('1'));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const rev = result.revision;
     expect(rev.id).toBe('r-1'); // 经由注入的 uuid 生成（浏览器环境为 crypto.randomUUID）
     expect(rev.parentRevisionIds).toEqual([parent]);
     expect(rev.clientId).toBe('c1');
     expect(rev.plan.roots).toHaveLength(1);
     expect(sync.head.id).toBe(rev.id);
     sync.destroy();
+  });
+});
+
+describe('旧版双键数据迁移', () => {
+  it('新键缺失时迁移 revisions/v1 + head/v1 为单键状态，head 保持一致并清理旧键', () => {
+    const storage = new MemStorage();
+    const genesis: Revision = {
+      id: GENESIS_REVISION_ID,
+      parentRevisionIds: [],
+      clientId: 'c',
+      plan: emptyPlan(),
+    };
+    const leaf: Revision = {
+      id: 'leaf',
+      parentRevisionIds: [GENESIS_REVISION_ID],
+      clientId: 'c',
+      plan: rootOnlyPlan('1'),
+    };
+    storage.setItem(
+      REVISIONS_STORAGE_KEY,
+      JSON.stringify({ version: 1, revisions: [genesis, leaf] } satisfies {
+        version: 1;
+        revisions: Revision[];
+      }),
+    );
+    storage.setItem(HEAD_STORAGE_KEY, 'leaf');
+
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    expect(s.head.id).toBe('leaf');
+    const state = readState(storage);
+    expect(state.version).toBe(2);
+    expect(state.headId).toBe('leaf');
+    expect(state.revisions.map((x) => x.id)).toEqual([GENESIS_REVISION_ID, 'leaf']);
+    // 旧键在迁移成功后清理
+    expect(storage.getItem(REVISIONS_STORAGE_KEY)).toBeNull();
+    expect(storage.getItem(HEAD_STORAGE_KEY)).toBeNull();
+    expect(r.warnings.join(' ')).toContain('迁移');
+    s.destroy();
+  });
+
+  it('新键存在时优先使用新键，不读取也不删除残留旧键', () => {
+    const storage = new MemStorage();
+    const oldLeaf: Revision = {
+      id: 'old-leaf',
+      parentRevisionIds: [GENESIS_REVISION_ID],
+      clientId: 'c',
+      plan: rootOnlyPlan('old'),
+    };
+    storage.setItem(
+      REVISIONS_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        revisions: [
+          { id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c', plan: emptyPlan() },
+          oldLeaf,
+        ],
+      }),
+    );
+    storage.setItem(HEAD_STORAGE_KEY, 'old-leaf');
+
+    storage.setItem(
+      STATE_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        headId: 'new-leaf',
+        revisions: [
+          { id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c2', plan: emptyPlan() },
+          {
+            id: 'new-leaf',
+            parentRevisionIds: [GENESIS_REVISION_ID],
+            clientId: 'c2',
+            plan: rootOnlyPlan('new'),
+          },
+        ],
+      }),
+    );
+
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    expect(s.head.id).toBe('new-leaf');
+    // 旧键保留（不被迁移路径触碰）
+    expect(storage.getItem(HEAD_STORAGE_KEY)).toBe('old-leaf');
+    expect(r.warnings).toHaveLength(0);
+    s.destroy();
+  });
+
+  it('迁移时旧 head 缺失/损坏，恢复到叶子修订后再迁移', () => {
+    const storage = new MemStorage();
+    storage.setItem(
+      REVISIONS_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        revisions: [
+          { id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c', plan: emptyPlan() },
+          {
+            id: 'leaf',
+            parentRevisionIds: [GENESIS_REVISION_ID],
+            clientId: 'c',
+            plan: rootOnlyPlan('1'),
+          },
+        ],
+      }),
+    );
+    // 不写 head
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    expect(s.head.id).toBe('leaf');
+    expect(readState(storage).headId).toBe('leaf');
+    expect(storage.getItem(REVISIONS_STORAGE_KEY)).toBeNull();
+    expect(r.warnings.join(' ')).toMatch(/head|迁移/);
+    s.destroy();
+  });
+
+  it('迁移后提交的新修订写入新键，不再触碰旧键', () => {
+    const storage = new MemStorage();
+    storage.setItem(
+      REVISIONS_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        revisions: [
+          { id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c', plan: emptyPlan() },
+        ],
+      }),
+    );
+    storage.setItem(HEAD_STORAGE_KEY, GENESIS_REVISION_ID);
+
+    const s = openSync(storage, 'c1', rec(), counterUuid('m'));
+    expect(storage.getItem(REVISIONS_STORAGE_KEY)).toBeNull();
+    const result = s.commit(rootOnlyPlan('after'));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const state = readState(storage);
+    expect(state.headId).toBe(result.revision.id);
+    expect(state.revisions).toHaveLength(2);
+    s.destroy();
   });
 });
 
@@ -240,17 +410,20 @@ describe('跨标签页广播同步', () => {
     const storage = new MemStorage();
     const r1 = rec();
     const s1 = openSync(storage, 'c1', r1, counterUuid('c1'));
-    const a = s1.commit(rootOnlyPlan('1'));
-    const b = s1.commit(rootOnlyPlan('2'));
+    const ra = s1.commit(rootOnlyPlan('1'));
+    const rb = s1.commit(rootOnlyPlan('2'));
+    expect(ra.ok && rb.ok).toBe(true);
+    const a = (ra as { ok: true; revision: Revision }).revision;
+    const b = (rb as { ok: true; revision: Revision }).revision;
     s1.destroy();
 
     // 从存储中移除 a 再重新打开（模拟缺口），然后补送 a
-    const doc = JSON.parse(storage.getItem(REVISIONS_STORAGE_KEY)!);
+    const state = readState(storage);
     const withoutA = {
-      ...doc,
-      revisions: doc.revisions.filter((x: Revision) => x.id !== a.id),
+      ...state,
+      revisions: state.revisions.filter((x: Revision) => x.id !== a.id),
     };
-    storage.setItem(REVISIONS_STORAGE_KEY, JSON.stringify(withoutA));
+    storage.setItem(STATE_STORAGE_KEY, JSON.stringify(withoutA));
 
     const r2 = rec();
     const ch2 = new FakeChannel('test');
@@ -318,7 +491,8 @@ describe('跨标签页广播同步', () => {
 
     const remoteRev = r1.conflicts[0];
     // s1 采用外部版本：合并修订同时引用两个版本
-    s1.mergeAndHead(remoteRev.plan, remoteRev.id);
+    const mergeResult = s1.mergeAndHead(remoteRev.plan, remoteRev.id);
+    expect(mergeResult.ok).toBe(true);
     const merge = s1.head;
     expect(merge.parentRevisionIds).toHaveLength(2);
     expect(merge.parentRevisionIds).toContain(remoteRev.id);
@@ -389,9 +563,255 @@ describe('跨标签页广播同步', () => {
     ingest({ id: 'b', parentRevisionIds: [genesis], clientId: 'c3', plan: rootOnlyPlan('B') });
     expect(s.inConflict).toBe(true);
     const head = s.head.id;
-    const returned = s.commit(rootOnlyPlan('should-not-happen'));
-    expect(returned.id).toBe(head);
+    const stateBefore = storage.getItem(STATE_STORAGE_KEY);
+    const result = s.commit(rootOnlyPlan('should-not-happen'));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('conflict-locked');
     expect(s.head.id).toBe(head);
+    // 冲突拒绝不产生幽灵版本：存储与图均无新增修订
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(stateBefore);
+    expect(readState(storage).revisions.some((x) => x.plan.roots[0]?.name === 'Rshould-not-happen'))
+      .toBe(false);
+    s.destroy();
+  });
+});
+
+describe('存储写入失败（配额耗尽/权限限制）：先落盘后改内存，失败修订不外泄', () => {
+  it('commit 写入失败：head 不切换、修订不入库不入图、不广播，返回明确错误', async () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const ch = new FakeChannel('test');
+    const posted: unknown[] = [];
+    const origPost = ch.postMessage.bind(ch);
+    ch.postMessage = (data: unknown) => {
+      posted.push(data);
+      origPost(data);
+    };
+    const s = openSync(storage, 'c1', r, counterUuid('m'), ch);
+    const beforeState = storage.getItem(STATE_STORAGE_KEY);
+    const beforeHead = s.head.id;
+    await flush();
+    const postedBaseline = posted.length; // openSync 创世修订会广播一次
+
+    // 此后所有新状态写入都失败（配额耗尽）
+    const realSet = MemStorage.prototype.setItem;
+    vi.spyOn(storage, 'setItem').mockImplementation((key: string, value: string) => {
+      if (key === STATE_STORAGE_KEY) {
+        const err = new Error('QuotaExceededError: 存储空间不足');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+      realSet.call(storage, key, value);
+    });
+
+    const result = s.commit(rootOnlyPlan('fail'));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('storage-error');
+      expect(result.message).toContain('本地存储');
+    }
+    // 内存状态完全回滚：head 未切换、图中没有失败修订
+    expect(s.head.id).toBe(beforeHead);
+    expect(s.getRevision('m-1')).toBeUndefined();
+    // 存储保持提交前内容（原子替换从未发生）
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(beforeState);
+    // 失败修订未广播（创世广播之外没有新消息）
+    await flush();
+    expect(posted).toHaveLength(postedBaseline);
+    s.destroy();
+  });
+
+  it('commit 失败后下一次成功提交仍正常（回滚不污染图，无幽灵版本）', async () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const ch = new FakeChannel('test');
+    const posted: unknown[] = [];
+    const origPost = ch.postMessage.bind(ch);
+    ch.postMessage = (data: unknown) => {
+      posted.push(data);
+      origPost(data);
+    };
+    const s = openSync(storage, 'c1', r, counterUuid('m'), ch);
+    const beforeHead = s.head.id;
+    await flush();
+    const postedBaseline = posted.length; // openSync 创世修订会广播一次
+
+    let failNext = true;
+    const spy = vi.spyOn(storage, 'setItem');
+    spy.mockImplementation((key: string, value: string) => {
+      if (key === STATE_STORAGE_KEY && failNext) {
+        const err = new Error('denied');
+        err.name = 'SecurityError';
+        throw err;
+      }
+      MemStorage.prototype.setItem.call(storage, key, value);
+    });
+
+    const failed = s.commit(rootOnlyPlan('dropped'));
+    expect(failed.ok).toBe(false);
+    expect(s.head.id).toBe(beforeHead);
+
+    failNext = false;
+    const ok = s.commit(rootOnlyPlan('kept'));
+    expect(ok.ok).toBe(true);
+    if (ok.ok) {
+      expect(s.head.id).toBe(ok.revision.id);
+      expect(ok.revision.parentRevisionIds).toEqual([GENESIS_REVISION_ID]); // 父版本是创世，不含幽灵
+      expect(readState(storage).headId).toBe(ok.revision.id);
+    }
+    await flush();
+    // 只有成功的一次被广播（创世广播之外仅一条）
+    expect(posted).toHaveLength(postedBaseline + 1);
+    expect((posted[postedBaseline] as { revision: Revision }).revision.plan.roots[0].name).toBe(
+      'Rkept',
+    );
+    s.destroy();
+  });
+
+  it('mergeAndHead 写入失败：保持冲突锁定与原 head，不广播合并修订', async () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const ch = new FakeChannel('test');
+    const posted: unknown[] = [];
+    const origPost = ch.postMessage.bind(ch);
+    ch.postMessage = (data: unknown) => {
+      posted.push(data);
+      origPost(data);
+    };
+    const s = openSync(storage, 'c1', r, counterUuid('m'), ch);
+    const genesis = s.head.id;
+    const ingest = (rev: Revision) =>
+      (s as unknown as { ingest(rev: Revision): void }).ingest(rev);
+    ingest({ id: 'a', parentRevisionIds: [genesis], clientId: 'c2', plan: rootOnlyPlan('A') });
+    ingest({ id: 'b', parentRevisionIds: [genesis], clientId: 'c3', plan: rootOnlyPlan('B') });
+    expect(s.inConflict).toBe(true);
+    const beforeHead = s.head.id;
+    const postedBeforeConflict = posted.length;
+
+    vi.spyOn(storage, 'setItem').mockImplementation(() => {
+      const err = new Error('QuotaExceededError');
+      err.name = 'QuotaExceededError';
+      throw err;
+    });
+
+    const result = s.mergeAndHead(rootOnlyPlan('merge'), 'b');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('storage-error');
+    // 冲突锁定保留，head 未切换
+    expect(s.inConflict).toBe(true);
+    expect(s.head.id).toBe(beforeHead);
+    await flush();
+    expect(posted).toHaveLength(postedBeforeConflict);
+    s.destroy();
+  });
+
+  it('外部修订 ingest 落盘失败：不切换 head、不触发快进/冲突，无幽灵节点', () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    const genesis = s.head.id;
+    const ingest = (rev: Revision) =>
+      (s as unknown as { ingest(rev: Revision): void }).ingest(rev);
+    const warningsBefore = r.warnings.length;
+
+    vi.spyOn(storage, 'setItem').mockImplementation(() => {
+      const err = new Error('QuotaExceededError');
+      err.name = 'QuotaExceededError';
+      throw err;
+    });
+
+    ingest({ id: 'ff', parentRevisionIds: [genesis], clientId: 'c2', plan: rootOnlyPlan('FF') });
+    expect(s.head.id).toBe(genesis);
+    expect(r.ff).toHaveLength(0);
+    expect(r.conflicts).toHaveLength(0);
+    expect(s.getRevision('ff')).toBeUndefined();
+    expect(r.warnings.length).toBeGreaterThan(warningsBefore);
+    expect(r.warnings[r.warnings.length - 1]).toContain('本地存储');
+
+    // 恢复存储后，同一修订可以正常 ingest（没有“半提交”残留阻止重试）
+    vi.restoreAllMocks();
+    ingest({ id: 'ff', parentRevisionIds: [genesis], clientId: 'c2', plan: rootOnlyPlan('FF') });
+    expect(s.head.id).toBe('ff');
+    expect(r.ff.map((f) => f.id)).toEqual(['ff']);
+    s.destroy();
+  });
+
+  it('冲突期间外部合并修订落盘失败：保持冲突锁定，不触发自动消解', () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    const genesis = s.head.id;
+    const ingest = (rev: Revision) =>
+      (s as unknown as { ingest(rev: Revision): void }).ingest(rev);
+    ingest({ id: 'local', parentRevisionIds: [genesis], clientId: 'c2', plan: rootOnlyPlan('L') });
+    ingest({ id: 'remote', parentRevisionIds: [genesis], clientId: 'c3', plan: rootOnlyPlan('R') });
+    expect(s.inConflict).toBe(true);
+
+    vi.spyOn(storage, 'setItem').mockImplementation(() => {
+      throw new Error('SecurityError: 写入被拒绝');
+    });
+    const merge: Revision = {
+      id: 'merge',
+      parentRevisionIds: ['local', 'remote'],
+      clientId: 'c2',
+      plan: rootOnlyPlan('M'),
+    };
+    ingest(merge);
+    expect(s.inConflict).toBe(true);
+    expect(s.head.id).toBe('local');
+    expect(s.getRevision('merge')).toBeUndefined();
+    expect(r.ff.map((f) => f.id)).toEqual(['local']); // 仅此前成功的快进
+    s.destroy();
+  });
+
+  it('空存储启动时创世写入失败：给出明确警告，提交持续失败但不产生幽灵版本', () => {
+    const storage = new FailingStorage(() => true, 'SecurityError');
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('g'));
+    expect(s.head.id).toBe(GENESIS_REVISION_ID);
+    expect(r.warnings.join(' ')).toContain('本地存储');
+    // 存储中确实什么都没有
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBeNull();
+
+    const result = s.commit(rootOnlyPlan('x'));
+    expect(result.ok).toBe(false);
+    expect(s.head.id).toBe(GENESIS_REVISION_ID);
+    s.destroy();
+  });
+
+  it('迁移旧版双键时新键写入失败：保留旧键不删除，并给出明确错误', () => {
+    const backing = new Map<string, string>();
+    backing.set(
+      REVISIONS_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        revisions: [
+          { id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c', plan: emptyPlan() },
+        ],
+      }),
+    );
+    backing.set(HEAD_STORAGE_KEY, GENESIS_REVISION_ID);
+    const storage: Storage = {
+      get length() {
+        return backing.size;
+      },
+      clear: () => backing.clear(),
+      getItem: (k) => (backing.has(k) ? backing.get(k)! : null),
+      key: (i) => [...backing.keys()][i] ?? null,
+      removeItem: (k) => backing.delete(k),
+      setItem: (k, v) => {
+        if (k === STATE_STORAGE_KEY) throw new Error('QuotaExceededError');
+        backing.set(k, v);
+      },
+    };
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('m'));
+    expect(s.head.id).toBe(GENESIS_REVISION_ID);
+    // 迁移失败：旧键原样保留，新键不存在
+    expect(storage.getItem(REVISIONS_STORAGE_KEY)).not.toBeNull();
+    expect(storage.getItem(HEAD_STORAGE_KEY)).toBe(GENESIS_REVISION_ID);
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBeNull();
+    expect(r.warnings.join(' ')).toContain('本地存储');
     s.destroy();
   });
 });
@@ -489,9 +909,10 @@ describe('损坏快照', () => {
       plan: rootOnlyPlan('1'),
     };
     storage.setItem(
-      REVISIONS_STORAGE_KEY,
+      STATE_STORAGE_KEY,
       JSON.stringify({
-        version: 1,
+        version: 2,
+        headId: 'good',
         revisions: [
           { id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c', plan: emptyPlan() },
           good,
@@ -499,7 +920,6 @@ describe('损坏快照', () => {
         ],
       }),
     );
-    storage.setItem(HEAD_STORAGE_KEY, 'good');
     const r = rec();
     const s = openSync(storage, 'c2', r, counterUuid('z'));
     expect(s.head.id).toBe('good');
@@ -522,10 +942,10 @@ describe('损坏快照', () => {
       plan: rootOnlyPlan('1'),
     };
     storage.setItem(
-      REVISIONS_STORAGE_KEY,
-      JSON.stringify({ version: 1, revisions: [genesis, leaf] }),
+      STATE_STORAGE_KEY,
+      JSON.stringify({ version: 2, headId: null, revisions: [genesis, leaf] }),
     );
-    // 不写 head
+    // 不写有效 head
     const r = rec();
     const s = openSync(storage, 'c2', r, counterUuid('z'));
     expect(s.head.id).toBe('leaf');
@@ -535,7 +955,7 @@ describe('损坏快照', () => {
 
   it('整个文档不可解析时忽略并从空规划重新开始', () => {
     const storage = new MemStorage();
-    storage.setItem(REVISIONS_STORAGE_KEY, '{not json');
+    storage.setItem(STATE_STORAGE_KEY, '{not json');
     const r = rec();
     const s = openSync(storage, 'c1', r, counterUuid('z'));
     expect(s.head.id).toBe(GENESIS_REVISION_ID);

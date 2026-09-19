@@ -96,6 +96,11 @@ export default function App() {
   const syncRef = useRef<RevisionSync | null>(null);
   const planRef = useRef<Plan>(plan);
   planRef.current = plan;
+  // 撤销/重做需在“先落盘后改界面”的前提下读取栈内容，用 ref 保留同步镜像。
+  const pastRef = useRef<Plan[]>(past);
+  pastRef.current = past;
+  const futureRef = useRef<Plan[]>(future);
+  futureRef.current = future;
   const conflictRef = useRef(conflict);
   conflictRef.current = conflict;
 
@@ -104,50 +109,80 @@ export default function App() {
     window.setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 6000);
   }, []);
 
-  /** 所有状态变更的唯一入口：发布 revision、记录历史、清空重做栈。 */
+  /**
+   * 尝试发布修订：只有修订完整落盘后才更新界面规划与撤销/重做历史并返回成功。
+   * 写入失败（配额耗尽/权限受限）时保留提交前规划、显示明确错误并返回 false，
+   * 绝不产生刷新即丢的幽灵版本，也不会向其他标签页广播（广播由 sync 内部完成）。
+   */
   const commit = useCallback(
-    (next: Plan) => {
+    (next: Plan): boolean => {
       const sync = syncRef.current;
-      if (sync?.inConflict) return; // 冲突期间禁止规划编辑
+      if (sync?.inConflict) return false; // 冲突期间禁止规划编辑
+      if (!sync) {
+        // 无持久化后端（启动前/SSR）：仅更新界面，保持历史行为。
+        const current = planRef.current;
+        setPast((p) => [...p, current]);
+        setFuture([]);
+        setPlan(next);
+        planRef.current = next;
+        return true;
+      }
+      const result = sync.commit(next);
+      if (!result.ok) {
+        showToast(result.message);
+        return false;
+      }
       const current = planRef.current;
       setPast((p) => [...p, current]);
       setFuture([]);
       setPlan(next);
       planRef.current = next;
-      sync?.commit(next);
+      return true;
     },
-    [],
+    [showToast],
   );
 
   const undo = useCallback(() => {
     const sync = syncRef.current;
     if (!sync || sync.inConflict) return;
-    setPast((p) => {
-      if (p.length === 0) return p;
-      const prev = p[p.length - 1];
-      const current = planRef.current;
-      setFuture((f) => [current, ...f]);
-      setPlan(prev);
-      planRef.current = prev;
-      sync.commit(prev); // 撤销同样发布为一个新修订
-      return p.slice(0, -1);
-    });
-  }, []);
+    if (pastRef.current.length === 0) return;
+    const prev = pastRef.current[pastRef.current.length - 1];
+    const result = sync.commit(prev); // 撤销同样发布为一个新修订
+    if (!result.ok) {
+      showToast(result.message);
+      return; // 落盘失败：保留当前规划与撤销/重做栈
+    }
+    const current = planRef.current;
+    const nextFuture = [current, ...futureRef.current];
+    setFuture(nextFuture);
+    futureRef.current = nextFuture;
+    setPlan(prev);
+    planRef.current = prev;
+    const nextPast = pastRef.current.slice(0, -1);
+    setPast(nextPast);
+    pastRef.current = nextPast;
+  }, [showToast]);
 
   const redo = useCallback(() => {
     const sync = syncRef.current;
     if (!sync || sync.inConflict) return;
-    setFuture((f) => {
-      if (f.length === 0) return f;
-      const next = f[0];
-      const current = planRef.current;
-      setPast((p) => [...p, current]);
-      setPlan(next);
-      planRef.current = next;
-      sync.commit(next); // 重做同样发布为一个新修订
-      return f.slice(1);
-    });
-  }, []);
+    if (futureRef.current.length === 0) return;
+    const next = futureRef.current[0];
+    const result = sync.commit(next); // 重做同样发布为一个新修订
+    if (!result.ok) {
+      showToast(result.message);
+      return; // 落盘失败：保留当前规划与撤销/重做栈
+    }
+    const current = planRef.current;
+    const nextPast = [...pastRef.current, current];
+    setPast(nextPast);
+    pastRef.current = nextPast;
+    setPlan(next);
+    planRef.current = next;
+    const nextFuture = futureRef.current.slice(1);
+    setFuture(nextFuture);
+    futureRef.current = nextFuture;
+  }, [showToast]);
 
   // ---- 启动：恢复 head 修订并接入跨标签页广播 ----
   useEffect(() => {
@@ -180,9 +215,12 @@ export default function App() {
       {
         onFastForward: (rev) => {
           // 外部更新可快进：作为一次可撤销变更并入本页历史。
+          // （此回调由 sync 在状态完整落盘成功后触发，无需再判失败。）
           const current = planRef.current;
           setPast((p) => [...p, current]);
+          pastRef.current = [...pastRef.current, current];
           setFuture([]);
+          futureRef.current = [];
           setPlan(rev.plan);
           planRef.current = rev.plan;
           setMigration(null); // 基于旧规划的待确认迁移已过期
@@ -235,12 +273,19 @@ export default function App() {
       if (!sync || !cur) return;
       const current = planRef.current;
       const chosen = choice === 'local' ? cur.local.plan : cur.remote.plan;
-      sync.mergeAndHead(chosen, cur.remote.id);
+      // 合并修订必须先完整落盘：失败时保持冲突锁定与原规划，不清空冲突弹窗。
+      const result = sync.mergeAndHead(chosen, cur.remote.id);
+      if (!result.ok) {
+        showToast(result.message);
+        return;
+      }
       // 合并是一次显式变更：选择外部版本时合并前状态可一次撤销回来；
       // 选择保留本页时内容未变（仅合并修订图），不入历史栈。
       if (chosen !== current) {
         setPast((p) => [...p, current]);
+        pastRef.current = [...pastRef.current, current];
         setFuture([]);
+        futureRef.current = [];
         setPlan(chosen);
         planRef.current = chosen;
       }
@@ -264,8 +309,7 @@ export default function App() {
         allocations: applyMigration(nextAllocs, mig),
       };
       if (mig.ok && mig.items.every((i) => i.status === 'kept')) {
-        commit(next);
-        showToast('已应用：所有分配均可原位保留');
+        if (commit(next)) showToast('已应用：所有分配均可原位保留');
       } else {
         setMigration({ title, plan: mig, next });
       }
@@ -281,7 +325,9 @@ export default function App() {
       const errors = validateRoots([...plan.roots, root]);
       if (errors.length > 0) return errors;
       const normalized = { ...root, cidr: cidrToString(parseCidr(root.cidr)!) };
-      commit({ ...plan, roots: [...plan.roots, normalized] });
+      if (!commit({ ...plan, roots: [...plan.roots, normalized] })) {
+        return ['保存失败：本地存储写入失败，本次添加未生效，请清理浏览器存储后重试'];
+      }
       return [];
     },
     [commit],
@@ -332,7 +378,9 @@ export default function App() {
         cidr: cidrToString(parsed),
         note: note.trim() || undefined,
       };
-      commit({ ...plan, allocations: [...plan.allocations, alloc] });
+      if (!commit({ ...plan, allocations: [...plan.allocations, alloc] })) {
+        return ['保存失败：本地存储写入失败，本次保留段未生效，请清理浏览器存储后重试'];
+      }
       return [];
     },
     [commit],
@@ -368,7 +416,9 @@ export default function App() {
         cidr: cidrToString(slot),
         note: note.trim() || undefined,
       };
-      commit({ ...plan, allocations: [...plan.allocations, alloc] });
+      if (!commit({ ...plan, allocations: [...plan.allocations, alloc] })) {
+        return ['保存失败：本地存储写入失败，本次申请未生效，请清理浏览器存储后重试'];
+      }
       return [];
     },
     [commit],
@@ -389,7 +439,9 @@ export default function App() {
           .map((l) => `第 ${l.row} 行${l.name ? `（${l.name}）` : ''}：${l.reason}`);
       }
       const added = allocationsFromBatchPlan(batch);
-      commit({ ...plan, allocations: [...plan.allocations, ...added] });
+      if (!commit({ ...plan, allocations: [...plan.allocations, ...added] })) {
+        return ['保存失败：本地存储写入失败，整批申请均未生效，请清理浏览器存储后重试'];
+      }
       showToast(`批量申请已原子加入 ${added.length} 项分配（可一次撤销）`);
       return [];
     },
@@ -399,8 +451,9 @@ export default function App() {
   const releaseAllocation = useCallback(
     (id: string) => {
       const plan = planRef.current;
-      commit({ ...plan, allocations: plan.allocations.filter((a) => a.id !== id) });
-      showToast('已释放，相邻空闲伙伴块已自动合并');
+      if (commit({ ...plan, allocations: plan.allocations.filter((a) => a.id !== id) })) {
+        showToast('已释放，相邻空闲伙伴块已自动合并');
+      }
     },
     [commit, showToast],
   );
@@ -440,8 +493,7 @@ export default function App() {
     (text: string) => {
       try {
         const imported = parsePlanJson(text);
-        commit(imported);
-        showToast('规划导入成功');
+        if (commit(imported)) showToast('规划导入成功');
       } catch (e) {
         showToast((e as Error).message);
       }
@@ -478,7 +530,10 @@ export default function App() {
       if (!backupImport) return '没有待导入的备份文件';
       try {
         const imported = await importPlanBackup(backupImport.text, password);
-        commit(imported);
+        if (!commit(imported)) {
+          // commit 已显示明确错误；同时在弹窗内提示，保持当前规划不被替换。
+          return '保存失败：本地存储写入失败，导入未生效，请清理浏览器存储后重试';
+        }
         setBackupImport(null);
         showToast('加密备份导入成功');
         return null;
@@ -582,9 +637,11 @@ export default function App() {
           title={migration.title}
           plan={migration.plan}
           onConfirm={() => {
-            commit(migration.next);
-            setMigration(null);
-            showToast('迁移已整批原子应用');
+            if (commit(migration.next)) {
+              setMigration(null);
+              showToast('迁移已整批原子应用');
+            }
+            // 失败时错误已提示，保留提交前规划与迁移弹窗，允许重试或取消
           }}
           onCancel={() => setMigration(null)}
         />
